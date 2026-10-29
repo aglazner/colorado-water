@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Colorado Plateau Rivers & Lake Powell</title>
+<style>
+  :root { --bg:#fff; --fg:#1d2327; --muted:#6b7580; --grid:#e3e7ea; --card:#f7f8f9; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#16191c; --fg:#e8ebed; --muted:#98a2ab; --grid:#2c3238; --card:#1e2226; }
+  }
+  body { font-family: system-ui, sans-serif; background:var(--bg); color:var(--fg); margin:0; padding:16px; }
+  .wrap { max-width: 1000px; margin: 0 auto; }
+  h1 { font-size: 1.3rem; margin: 0 0 4px; }
+  .sub { color:var(--muted); font-size:.85rem; margin-bottom:14px; }
+  .controls { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:14px; }
+  button { border:1px solid var(--grid); background:var(--card); color:var(--fg); padding:6px 14px; border-radius:6px; cursor:pointer; font-size:.9rem; }
+  button.on { background:#2a6fdb; border-color:#2a6fdb; color:#fff; }
+  label { font-size:.85rem; color:var(--muted); margin-left:10px; }
+  .card { background:var(--card); border-radius:10px; padding:12px; margin-bottom:16px; position:relative; }
+  .card h2 { font-size:1rem; margin:0 0 6px; }
+  .legend { display:flex; gap:16px; flex-wrap:wrap; font-size:.85rem; margin-bottom:4px; }
+  .legend span::before { content:""; display:inline-block; width:12px; height:3px; margin-right:6px; vertical-align:middle; background:var(--c); }
+  svg { width:100%; height:auto; display:block; }
+  .tip { position:absolute; pointer-events:none; background:var(--bg); border:1px solid var(--grid); border-radius:6px; padding:6px 8px; font-size:.78rem; display:none; white-space:nowrap; box-shadow:0 2px 8px rgba(0,0,0,.2); z-index:5; }
+  .status { font-size:.8rem; color:var(--muted); }
+  .err { color:#c0392b; }
+  .latest { font-size:.82rem; color:var(--muted); margin-top:4px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Colorado Plateau rivers &amp; Lake Powell</h1>
+  <div class="sub">Live data from USGS National Water Information System. Discharge in cubic feet per second (cfs); lake elevation in feet.</div>
+
+  <div class="controls">
+    <button data-r="7">7 days</button>
+    <button data-r="30">30 days</button>
+    <button data-r="365">1 year</button>
+    <label><input type="checkbox" id="log"> log scale (discharge)</label>
+    <label><input type="checkbox" id="showSum" checked> sum of Green + Colorado + San Juan</label>
+    <label><input type="checkbox" id="showLees" checked> Lees Ferry</label>
+    <span class="status" id="status"></span>
+  </div>
+
+  <div class="card" id="cardQ">
+    <h2>River discharge</h2>
+    <div class="legend" id="legQ"></div>
+    <div id="chartQ"></div>
+    <div class="latest" id="latQ"></div>
+    <div class="tip" id="tipQ"></div>
+  </div>
+
+  <div class="card" id="cardL">
+    <h2>Lake Powell elevation (Glen Canyon Dam)</h2>
+    <div class="legend" id="legL"></div>
+    <div id="chartL"></div>
+    <div class="latest" id="latL"></div>
+    <div class="tip" id="tipL"></div>
+  </div>
+</div>
+
+<script>
+const RIVERS = [
+  { id:'09180500', name:'Colorado R. at Cisco, UT',     color:'#d9480f', sum:true },
+  { id:'09315000', name:'Green R. at Green River, UT',  color:'#2b8a3e', sum:true },
+  { id:'09379500', name:'San Juan R. near Bluff, UT',   color:'#1c7ed6', sum:true },
+  { id:'09380000', name:'Colorado R. at Lees Ferry, AZ (Glen Canyon Dam release)', color:'#c2255c', lees:true }
+];
+const LAKE = { id:'09379900', name:'Lake Powell elevation', color:'#7048e8' };
+const BASE = 'https://waterservices.usgs.gov/nwis/';
+
+let range = 30;
+const $ = id => document.getElementById(id);
+
+// ---- Data access: new USGS Water Data API first, legacy WaterServices as fallback ----
+const NEW = 'https://api.waterdata.usgs.gov/ogcapi/v1/collections/';
+const OLD = 'https://waterservices.usgs.gov/nwis/';
+
+async function fetchJSON(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  return r.json();
+}
+
+async function viaNew(site, params, range) {
+  const coll = range <= 30 ? 'continuous' : 'daily';
+  let url = `${NEW}${coll}/items?f=json&skipGeometry=true&limit=50000` +
+            `&monitoring_location_id=USGS-${site}&parameter_code=${params}&time=P${range}D` +
+            `&properties=parameter_code,time,value`;
+  if (coll === 'daily') url += '&statistic_id=00003';
+  const j = await fetchJSON(url);
+  const by = {};
+  (j.features || []).forEach(f => {
+    const p = f.properties, v = parseFloat(p.value);
+    if (!isFinite(v)) return;
+    (by[p.parameter_code] = by[p.parameter_code] || []).push([new Date(p.time).getTime(), v]);
+  });
+  return Object.entries(by).map(([param, pts]) => ({ param, pts: pts.sort((a,b) => a[0]-b[0]) }));
+}
+
+async function viaOld(site, params, range) {
+  const svc = range <= 30 ? 'iv' : 'dv';
+  const j = await fetchJSON(`${OLD}${svc}/?format=json&sites=${site}&parameterCd=${params}&period=P${range}D&siteStatus=all`);
+  return j.value.timeSeries.map(ts => ({
+    param: ts.variable.variableCode[0].value,
+    pts: (ts.values[0]?.value || [])
+      .map(v => [new Date(v.dateTime).getTime(), parseFloat(v.value)])
+      .filter(p => isFinite(p[1]) && p[1] !== ts.variable.noDataValue)
+  }));
+}
+
+async function getUSGS(site, params, range) {
+  let e1;
+  try {
+    const r = await viaNew(site, params, range);
+    if (r.some(s => s.pts.length)) return r;
+    e1 = new Error('no data');
+  } catch (e) { e1 = e; }
+  try { return await viaOld(site, params, range); }
+  catch (e2) { throw new Error(`${site}: new API (${e1.message}); legacy API (${e2.message})`); }
+}
+
+function fmtDate(t, range) {
+  const d = new Date(t);
+  const o = range <= 7 ? {month:'short', day:'numeric', hour:'numeric'} :
+            range <= 30 ? {month:'short', day:'numeric'} : {month:'short', year:'2-digit'};
+  return d.toLocaleString(undefined, o);
+}
+
+function niceTicks(min, max, n) {
+  const span = max - min || 1, step0 = span / n;
+  const mag = Math.pow(10, Math.floor(Math.log10(step0)));
+  const step = [1,2,2.5,5,10].map(m => m*mag).find(s => s >= step0) || 10*mag;
+  const out = [];
+  for (let v = Math.ceil(min/step)*step; v <= max + 1e-9; v += step) out.push(v);
+  return out;
+}
+
+function draw(el, tipEl, legEl, latEl, series, opts) {
+  const W = 900, H = 340, m = {l:62, r:14, t:10, b:30};
+  const all = series.flatMap(s => s.pts);
+  el.innerHTML = '';
+  legEl.innerHTML = series.map(s => `<span style="--c:${s.color}">${s.name}</span>`).join('');
+  if (!all.length) { el.innerHTML = '<div class="err">No data returned.</div>'; return; }
+
+  const t0 = Math.min(...all.map(p => p[0])), t1 = Math.max(...all.map(p => p[0]));
+  let v0 = Math.min(...all.map(p => p[1])), v1 = Math.max(...all.map(p => p[1]));
+  const log = opts.log && v0 > 0;
+  const f = log ? Math.log10 : (x => x);
+  let y0, y1, ticks;
+  if (log) {
+    y0 = Math.floor(Math.log10(v0)); y1 = Math.ceil(Math.log10(v1));
+    if (y1 === y0) y1++;
+    ticks = []; for (let e = y0; e <= y1; e++) ticks.push(Math.pow(10, e));
+  } else {
+    const pad = (v1 - v0) * 0.06 || 1;
+    if (!opts.zero) { y0 = v0 - pad; } else { y0 = Math.min(0, v0); }
+    y1 = v1 + pad;
+    ticks = niceTicks(y0, y1, 6);
+  }
+  const X = t => m.l + (t - t0) / (t1 - t0 || 1) * (W - m.l - m.r);
+  const Y = v => H - m.b - (f(v) - (log ? y0 : y0)) / ((log ? y1 : y1) - (log ? y0 : y0)) * (H - m.t - m.b);
+
+  let g = '';
+  ticks.forEach(v => {
+    const y = Y(v);
+    g += `<line x1="${m.l}" x2="${W-m.r}" y1="${y}" y2="${y}" stroke="var(--grid)"/>`;
+    g += `<text x="${m.l-6}" y="${y+4}" text-anchor="end" font-size="11" fill="var(--muted)">${v.toLocaleString(undefined,{maximumFractionDigits:2})}</text>`;
+  });
+  for (let i = 0; i <= 5; i++) {
+    const t = t0 + (t1 - t0) * i / 5, x = X(t);
+    g += `<text x="${x}" y="${H-10}" text-anchor="${i==0?'start':i==5?'end':'middle'}" font-size="11" fill="var(--muted)">${fmtDate(t, range)}</text>`;
+  }
+  series.forEach(s => {
+    if (!s.pts.length) return;
+    const d = s.pts.map((p,i) => (i?'L':'M') + X(p[0]).toFixed(1) + ' ' + Y(p[1]).toFixed(1)).join('');
+    g += `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="${s.width||1.8}" ${s.dash?`stroke-dasharray="${s.dash}"`:''} stroke-linejoin="round"/>`;
+  });
+  g += `<line id="cur" y1="${m.t}" y2="${H-m.b}" stroke="var(--muted)" stroke-dasharray="3 3" style="display:none"/>`;
+  g += `<text x="14" y="${H/2}" transform="rotate(-90 14 ${H/2})" text-anchor="middle" font-size="11" fill="var(--muted)">${opts.ylabel}</text>`;
+  el.innerHTML = `<svg viewBox="0 0 ${W} ${H}">${g}<rect x="${m.l}" y="${m.t}" width="${W-m.l-m.r}" height="${H-m.t-m.b}" fill="transparent" id="hit"/></svg>`;
+
+  // latest values
+  latEl.innerHTML = series.filter(s => s.pts.length).map(s => {
+    const p = s.pts[s.pts.length-1];
+    return `${s.name}: <b>${p[1].toLocaleString()}</b> ${opts.unit} (${new Date(p[0]).toLocaleString()})`;
+  }).join(' &nbsp;|&nbsp; ');
+
+  // hover
+  const svg = el.querySelector('svg'), hit = el.querySelector('#hit'), cur = el.querySelector('#cur');
+  hit.addEventListener('mousemove', e => {
+    const r = svg.getBoundingClientRect();
+    const xpx = (e.clientX - r.left) / r.width * W;
+    const t = t0 + (xpx - m.l) / (W - m.l - m.r) * (t1 - t0);
+    let html = `<b>${new Date(t).toLocaleString()}</b>`;
+    series.forEach(s => {
+      if (!s.pts.length) return;
+      let best = s.pts[0], bd = Infinity;
+      for (const p of s.pts) { const dd = Math.abs(p[0]-t); if (dd < bd) { bd = dd; best = p; } }
+      html += `<br><span style="color:${s.color}">●</span> ${s.name}: ${best[1].toLocaleString()} ${opts.unit}`;
+    });
+    tipEl.innerHTML = html; tipEl.style.display = 'block';
+    const cr = el.parentElement.getBoundingClientRect();
+    tipEl.style.left = Math.min(e.clientX - cr.left + 14, cr.width - 260) + 'px';
+    tipEl.style.top = (e.clientY - cr.top + 14) + 'px';
+    cur.setAttribute('x1', xpx); cur.setAttribute('x2', xpx); cur.style.display = '';
+  });
+  hit.addEventListener('mouseleave', () => { tipEl.style.display = 'none'; cur.style.display = 'none'; });
+}
+
+
+let cacheQ = [], lSeries = [];
+
+// Sum of the three unregulated-reach gauges, only where all three have a value
+// at (nearly) the same time. Timestamps are binned to 15 min (or 1 day for 1-year view).
+function sumSeries(three) {
+  const bin = range <= 30 ? 15*60*1000 : 24*3600*1000;
+  const maps = three.map(s => { const m = new Map(); s.pts.forEach(p => m.set(Math.round(p[0]/bin)*bin, p[1])); return m; });
+  if (maps.some(m => !m.size)) return [];
+  const out = [];
+  for (const [t, v] of maps[0]) {
+    let tot = v, all = true;
+    for (let i = 1; i < maps.length; i++) { if (!maps[i].has(t)) { all = false; break; } tot += maps[i].get(t); }
+    if (all) out.push([t, Math.round(tot*10)/10]);
+  }
+  return out.sort((a,b) => a[0]-b[0]);
+}
+
+function render() {
+  const series = cacheQ.filter(s => !s.lees || $('showLees').checked);
+  if ($('showSum').checked) {
+    series.push({ name:'Sum: Green + Colorado (Cisco) + San Juan', color:'var(--fg)', dash:'6 4', width:2.2,
+                  pts: sumSeries(cacheQ.filter(s => s.sum)) });
+  }
+  draw($('chartQ'), $('tipQ'), $('legQ'), $('latQ'), series, {log: $('log').checked, ylabel:'Discharge (cfs)', unit:'cfs'});
+  draw($('chartL'), $('tipL'), $('legL'), $('latL'), lSeries, {log:false, ylabel:'Elevation (ft)', unit:'ft'});
+}
+
+async function load() {
+  $('status').textContent = 'Loading…'; $('status').className = 'status';
+  document.querySelectorAll('button[data-r]').forEach(b => b.classList.toggle('on', +b.dataset.r === range));
+  try {
+    const res = await Promise.allSettled([
+      ...RIVERS.map(r => getUSGS(r.id, '00060', range)),
+      getUSGS(LAKE.id, '62614,62615,00062', range)
+    ]);
+    const errs = res.filter(x => x.status === 'rejected').map(x => x.reason.message);
+    const ok = i => res[i].status === 'fulfilled' ? res[i].value : [];
+    const qSeries = RIVERS.map((r, i) => ({
+      name: r.name, color: r.color, sum: r.sum, lees: r.lees,
+      pts: ok(i).sort((a,b) => b.pts.length - a.pts.length)[0]?.pts || []
+    }));
+    // Lake: prefer 62614 (elev, NGVD29), else whichever has the most data
+    const lkSorted = ok(RIVERS.length).filter(s => s.pts.length).sort((a,b) =>
+      (b.param==='62614') - (a.param==='62614') || b.pts.length - a.pts.length);
+    lSeries = [{ name: LAKE.name + (lkSorted[0] ? ` (param ${lkSorted[0].param})` : ''), color: LAKE.color, pts: lkSorted[0]?.pts || [] }];
+    cacheQ = qSeries;
+    render();
+
+    $('status').textContent = errs.length ? 'Some series failed: ' + errs.join(' | ') : 'Updated ' + new Date().toLocaleTimeString();
+    $('status').className = errs.length ? 'status err' : 'status';
+  } catch (e) {
+    $('status').textContent = 'Error: ' + e.message; $('status').className = 'status err';
+  }
+}
+
+document.querySelectorAll('button[data-r]').forEach(b => b.onclick = () => { range = +b.dataset.r; load(); });
+$('log').onchange = render; $('showSum').onchange = render; $('showLees').onchange = render;
+load();
+setInterval(load, 15 * 60 * 1000);
+</script>
+</body>
+</html>
