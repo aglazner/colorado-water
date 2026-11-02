@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- Colorado Plateau rivers & Lake Powell dashboard, version 1.5 (2026-11-01) -->
+<!-- Colorado Plateau rivers & Lake Powell dashboard, version 1.8 (2026-11-01) -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -32,7 +32,7 @@
 <body>
 <div class="wrap">
   <h1>Colorado Plateau rivers &amp; Lake Powell</h1>
-  <div class="sub">Live data from USGS National Water Information System. Discharge in cubic feet per second (cfs); lake elevation in feet. <span style="opacity:.8">v1.5 · 2026-11-01</span></div>
+  <div class="sub">Live data from USGS National Water Information System. Discharge in cubic feet per second (cfs); lake elevation in feet. <span style="opacity:.8">v1.8 · 2026-11-01</span></div>
 
   <div class="controls">
     <button data-r="7">7 days</button>
@@ -62,6 +62,10 @@
   <div class="card" id="cardL">
     <h2>Lake Powell elevation (Glen Canyon Dam, NAVD 88)</h2>
     <div class="legend" id="legL"></div>
+    <div class="controls" style="margin:2px 0 6px">
+      <label style="margin-left:0"><input type="checkbox" id="showRate"> show rate of change (ft/day, right axis)</label>
+      <label>averaging window <input type="range" id="rateWin" min="0" max="100" value="52" style="vertical-align:middle;width:180px"> <b id="rateWinLabel"></b></label>
+    </div>
     <div id="chartL"></div>
     <div class="latest" id="latL"></div>
     <div class="tip" id="tipL"></div>
@@ -94,52 +98,46 @@ const BASE = 'https://waterservices.usgs.gov/nwis/';
 let range = 30;
 const $ = id => document.getElementById(id);
 
-// ---- Data access: new USGS Water Data API first, legacy WaterServices as fallback ----
+// ---- Data access: ONE request per time range, cached for 10 minutes ----
+// Uses the USGS Water Data API (api.waterdata.usgs.gov). All sites are fetched in a single
+// request, results are kept in localStorage, and if USGS throttles us (HTTP 429) the last
+// saved data are shown instead. (The legacy WaterServices fallback was removed: it is
+// IP-blocked after heavy use and is scheduled to shut down in early 2027.)
 const NEW = 'https://api.waterdata.usgs.gov/ogcapi/v1/collections/';
-const OLD = 'https://waterservices.usgs.gov/nwis/';
+const TTL = 10 * 60 * 1000;
 
-async function fetchJSON(url) {
-  const r = await fetch(url);
-  if (!r.ok) throw new Error('HTTP ' + r.status);
-  return r.json();
-}
+function cacheGet(r) { try { return JSON.parse(localStorage.getItem('cpw:' + r)); } catch (e) { return null; } }
+function cacheSet(r, o) { try { localStorage.setItem('cpw:' + r, JSON.stringify(o)); } catch (e) {} }
 
-async function viaNew(site, params, range) {
+async function fetchAll(range) {
+  const c = cacheGet(range);
+  if (c && c.data && Date.now() - c.t < TTL) return { data: c.data, t: c.t };
+  const sites = [...RIVERS.map(r => r.id), LAKE.id].map(id => 'USGS-' + id).join(',');
   const coll = range <= 30 ? 'continuous' : 'daily';
   let url = `${NEW}${coll}/items?f=json&skipGeometry=true&limit=50000` +
-            `&monitoring_location_id=USGS-${site}&parameter_code=${params}&time=P${range}D` +
-            `&properties=parameter_code,time,value`;
+            `&monitoring_location_id=${sites}&parameter_code=00060,62615&time=P${range}D` +
+            `&properties=monitoring_location_id,parameter_code,time,value`;
   if (coll === 'daily') url += '&statistic_id=00003';
-  const j = await fetchJSON(url);
-  const by = {};
-  (j.features || []).forEach(f => {
-    const p = f.properties, v = parseFloat(p.value);
-    if (!isFinite(v)) return;
-    (by[p.parameter_code] = by[p.parameter_code] || []).push([new Date(p.time).getTime(), v]);
-  });
-  return Object.entries(by).map(([param, pts]) => ({ param, pts: pts.sort((a,b) => a[0]-b[0]) }));
-}
-
-async function viaOld(site, params, range) {
-  const svc = range <= 30 ? 'iv' : 'dv';
-  const j = await fetchJSON(`${OLD}${svc}/?format=json&sites=${site}&parameterCd=${params}&period=P${range}D&siteStatus=all`);
-  return j.value.timeSeries.map(ts => ({
-    param: ts.variable.variableCode[0].value,
-    pts: (ts.values[0]?.value || [])
-      .map(v => [new Date(v.dateTime).getTime(), parseFloat(v.value)])
-      .filter(p => isFinite(p[1]) && p[1] !== ts.variable.noDataValue)
-  }));
-}
-
-async function getUSGS(site, params, range) {
-  let e1;
   try {
-    const r = await viaNew(site, params, range);
-    if (r.some(s => s.pts.length)) return r;
-    e1 = new Error('no data');
-  } catch (e) { e1 = e; }
-  try { return await viaOld(site, params, range); }
-  catch (e2) { throw new Error(`${site}: new API (${e1.message}); legacy API (${e2.message})`); }
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(r.status === 429 ? 'HTTP 429: USGS hourly request limit reached' : 'HTTP ' + r.status);
+    const j = await r.json();
+    const data = {};
+    (j.features || []).forEach(f => {
+      const p = f.properties, v = parseFloat(p.value);
+      if (!isFinite(v)) return;
+      const id = String(p.monitoring_location_id).replace('USGS-', '');
+      data[id] = data[id] || {};
+      (data[id][p.parameter_code] = data[id][p.parameter_code] || []).push([new Date(p.time).getTime(), v]);
+    });
+    Object.values(data).forEach(o => Object.values(o).forEach(a => a.sort((x, y) => x[0] - y[0])));
+    const t = Date.now();
+    cacheSet(range, { t, data });
+    return { data, t };
+  } catch (e) {
+    if (c && c.data) return { data: c.data, t: c.t, stale: true, err: e.message };
+    throw e;
+  }
 }
 
 function fmtDate(t, range) {
@@ -160,14 +158,16 @@ function niceTicks(min, max, n) {
 
 let clipN = 0;
 function draw(el, tipEl, legEl, latEl, series, opts) {
-  const W = 900, H = 340, m = {l:62, r:14, t:10, b:30};
+  const hasR = series.some(s => s.axis === 'R' && s.pts.length);
+  const W = 900, H = 340, m = {l:62, r: hasR ? 64 : 14, t:10, b:30};
   if (opts.log) series = series.map(s => ({...s, pts: s.pts.filter(p => p[1] > 0)}));
-  const all = series.flatMap(s => s.pts);
+  const all = series.filter(s => s.axis !== 'R').flatMap(s => s.pts);   // left-axis data
+  const allT = series.flatMap(s => s.pts);                              // for the time range
   el.innerHTML = '';
   legEl.innerHTML = series.map(s => `<span style="--c:${s.color}">${s.name}</span>`).join('');
   if (!all.length) { el.innerHTML = `<div class="err">${opts.empty || 'No data returned.'}</div>`; latEl.innerHTML = ''; return; }
 
-  const t0 = Math.min(...all.map(p => p[0])), t1 = Math.max(...all.map(p => p[0]));
+  const t0 = Math.min(...allT.map(p => p[0])), t1 = Math.max(...allT.map(p => p[0]));
   let v0 = Math.min(...all.map(p => p[1])), v1 = Math.max(...all.map(p => p[1]));
   const log = opts.log && v0 > 0;
   const f = log ? Math.log10 : (x => x);
@@ -209,6 +209,21 @@ function draw(el, tipEl, legEl, latEl, series, opts) {
   minors.forEach(v => { const y = Y(v);
     g += `<line x1="${m.l}" x2="${W-m.r}" y1="${y}" y2="${y}" stroke="var(--grid)" stroke-opacity="0.5" stroke-width="0.6"/>`;
     g += `<line x1="${m.l-3}" x2="${m.l}" y1="${y}" y2="${y}" stroke="var(--muted)" stroke-width="0.8"/>`; });
+  let YR = null;
+  if (hasR) {
+    const rp = series.filter(s => s.axis === 'R').flatMap(s => s.pts);
+    let r0 = Math.min(0, ...rp.map(p => p[1])), r1 = Math.max(0, ...rp.map(p => p[1]));
+    const rspan = (r1 - r0) || 0.1; r0 -= rspan * 0.06; r1 += rspan * 0.06;
+    const rt = niceTicks(r0, r1, 6);
+    YR = v => H - m.b - (v - r0) / (r1 - r0) * (H - m.t - m.b);
+    const rc = series.find(s => s.axis === 'R').color, xr = W - m.r;
+    g += `<line x1="${m.l}" x2="${xr}" y1="${YR(0)}" y2="${YR(0)}" stroke="${rc}" stroke-opacity="0.45" stroke-dasharray="4 3"/>`;
+    g += `<line x1="${xr}" x2="${xr}" y1="${m.t}" y2="${H-m.b}" stroke="${rc}"/>`;
+    rt.forEach(v => { const y = YR(v);
+      g += `<line x1="${xr}" x2="${xr+5}" y1="${y}" y2="${y}" stroke="${rc}"/>`;
+      g += `<text x="${xr+8}" y="${y+4}" font-size="11" fill="${rc}">${v.toLocaleString(undefined,{maximumFractionDigits:3})}</text>`; });
+    g += `<text x="${W-8}" y="${H/2}" transform="rotate(90 ${W-8} ${H/2})" text-anchor="middle" font-size="11" fill="${rc}">${opts.ylabelR || ''}</text>`;
+  }
   for (let i = 0; i <= 5; i++) {
     const t = t0 + (t1 - t0) * i / 5, x = X(t);
     g += `<text x="${x}" y="${H-10}" text-anchor="${i==0?'start':i==5?'end':'middle'}" font-size="11" fill="var(--muted)">${fmtDate(t, range)}</text>`;
@@ -217,7 +232,7 @@ function draw(el, tipEl, legEl, latEl, series, opts) {
   g += `<clipPath id="${clipId}"><rect x="${m.l}" y="${m.t}" width="${W-m.l-m.r}" height="${H-m.t-m.b}"/></clipPath><g clip-path="url(#${clipId})">`;
   series.forEach(s => {
     if (!s.pts.length) return;
-    const d = s.pts.map((p,i) => (i?'L':'M') + X(p[0]).toFixed(1) + ' ' + Y(p[1]).toFixed(1)).join('');
+    const d = s.pts.map((p,i) => (i?'L':'M') + X(p[0]).toFixed(1) + ' ' + (s.axis === 'R' ? YR : Y)(p[1]).toFixed(1)).join('');
     g += `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="${s.width||1.8}" ${s.dash?`stroke-dasharray="${s.dash}"`:''} stroke-linejoin="round"/>`;
   });
   g += '</g>';
@@ -228,7 +243,7 @@ function draw(el, tipEl, legEl, latEl, series, opts) {
   // latest values
   latEl.innerHTML = series.filter(s => s.pts.length).map(s => {
     const p = s.pts[s.pts.length-1];
-    return `${s.name}: <b>${p[1].toLocaleString()}</b> ${opts.unit} (${new Date(p[0]).toLocaleString()})`;
+    return `${s.name}: <b>${p[1].toLocaleString()}</b> ${s.unit || opts.unit} (${new Date(p[0]).toLocaleString()})`;
   }).join(' &nbsp;|&nbsp; ');
 
   // hover
@@ -242,7 +257,7 @@ function draw(el, tipEl, legEl, latEl, series, opts) {
       if (!s.pts.length) return;
       let best = s.pts[0], bd = Infinity;
       for (const p of s.pts) { const dd = Math.abs(p[0]-t); if (dd < bd) { bd = dd; best = p; } }
-      html += `<br><span style="color:${s.color}">●</span> ${s.name}: ${best[1].toLocaleString()} ${opts.unit}`;
+      html += `<br><span style="color:${s.color}">●</span> ${s.name}: ${best[1].toLocaleString()} ${s.unit || opts.unit}`;
     });
     tipEl.innerHTML = html; tipEl.style.display = 'block';
     const cr = el.parentElement.getBoundingClientRect();
@@ -297,8 +312,51 @@ function render() {
                     ...gcs.map(s => ({...s, width:1.2}))];
   draw($('chartG'), $('tipG'), $('legG'), $('latG'), gcSeries, {log: $('log').checked, logMin: 100, ylabel:'Discharge (cfs)', unit:'cfs'});
 
-  // Plot 3: lake
-  draw($('chartL'), $('tipL'), $('legL'), $('latL'), lSeries, {log:false, ylabel:'Elevation (ft, NAVD 88)', unit:'ft',
+  renderLake();
+}
+
+// ---- Rate of change of lake elevation (ft/day) ----
+// Local least-squares slope of elevation vs. time inside a sliding window of width w (days),
+// centered on each point. Near the ends the window is shifted inward (one-sided), so the last
+// values describe the most recent w days. Uses prefix sums, so it is fast for any window.
+function rateSeries(pts, w) {
+  const n = pts.length;
+  if (n < 3) return { pts: [], effDays: w };
+  const D = 86400000, T0 = pts[0][0], V0 = pts[0][1];
+  const x = pts.map(p => (p[0] - T0) / D), y = pts.map(p => p[1] - V0);
+  const span = x[n-1] - x[0];
+  w = Math.min(Math.max(w, 3 * span / (n - 1)), span);     // window holds at least ~3 samples
+  const Sx = [0], Sy = [0], Sxx = [0], Sxy = [0];
+  for (let i = 0; i < n; i++) {
+    Sx.push(Sx[i] + x[i]); Sy.push(Sy[i] + y[i]);
+    Sxx.push(Sxx[i] + x[i]*x[i]); Sxy.push(Sxy[i] + x[i]*y[i]);
+  }
+  const out = []; let lo = 0, hi = 0;
+  for (let i = 0; i < n; i++) {
+    const L = Math.min(Math.max(x[i] - w/2, x[0]), x[n-1] - w), R = L + w;
+    while (lo < n && x[lo] < L - 1e-9) lo++;
+    while (hi < n && x[hi] <= R + 1e-9) hi++;
+    const k = hi - lo; if (k < 3) continue;
+    const sx = Sx[hi]-Sx[lo], sy = Sy[hi]-Sy[lo], sxx = Sxx[hi]-Sxx[lo], sxy = Sxy[hi]-Sxy[lo];
+    const den = k*sxx - sx*sx; if (den <= 0) continue;
+    out.push([pts[i][0], (k*sxy - sx*sy) / den]);
+  }
+  return { pts: out, effDays: w };
+}
+
+function windowHours() { return 3 * Math.pow(56, $('rateWin').value / 100); }   // slider: 3 h ... 7 d (log scale)
+function fmtWin(h) { return h < 48 ? Math.round(h) + ' h' : (h / 24).toFixed(1) + ' d'; }
+
+function renderLake() {
+  const wh = windowHours();
+  $('rateWinLabel').textContent = fmtWin(wh);
+  const series = [...lSeries];
+  if ($('showRate').checked && lSeries[0] && lSeries[0].pts.length > 2) {
+    const r = rateSeries(lSeries[0].pts, wh / 24);
+    series.push({ name: `Rate of change, ft/day (${fmtWin(r.effDays * 24)} window)`, color:'#f76707', width:1.4,
+                  axis:'R', unit:'ft/day', pts: r.pts });
+  }
+  draw($('chartL'), $('tipL'), $('legL'), $('latL'), series, {log:false, ylabel:'Elevation (ft, NAVD 88)', ylabelR:'Rate of change (ft/day)', unit:'ft',
        empty:'No NAVD 88 elevation (parameter 62615) returned for this site.'});
 }
 
@@ -306,31 +364,32 @@ async function load() {
   $('status').textContent = 'Loading…'; $('status').className = 'status';
   document.querySelectorAll('button[data-r]').forEach(b => b.classList.toggle('on', +b.dataset.r === range));
   try {
-    const res = await Promise.allSettled([
-      ...RIVERS.map(r => getUSGS(r.id, '00060', range)),
-      getUSGS(LAKE.id, '62615', range)   // 62615 = lake/reservoir elevation above NAVD 1988
-    ]);
-    const errs = res.filter(x => x.status === 'rejected').map(x => x.reason.message);
-    const ok = i => res[i].status === 'fulfilled' ? res[i].value : [];
-    cacheQ = RIVERS.map((r, i) => ({
+    const res = await fetchAll(range);
+    const d = res.data;
+    cacheQ = RIVERS.map(r => ({
       name: r.name, color: r.color, dash: r.dash, core: r.core, minor: r.minor, gc: r.gc, lees: r.lees,
-      pts: ok(i).sort((a,b) => b.pts.length - a.pts.length)[0]?.pts || []
+      pts: (d[r.id] && d[r.id]['00060']) || []
     }));
-    const lk = ok(RIVERS.length).filter(s => s.param === '62615' && s.pts.length)[0];
-    lSeries = [{ name: LAKE.name + ' (62615)', color: LAKE.color, pts: lk ? lk.pts : [] }];
+    const lk = (d[LAKE.id] && d[LAKE.id]['62615']) || [];
+    lSeries = [{ name: LAKE.name + ' (62615)', color: LAKE.color, pts: lk }];
     render();
 
-    $('status').textContent = errs.length ? 'Some series failed: ' + errs.join(' | ') : 'Updated ' + new Date().toLocaleTimeString();
-    $('status').className = errs.length ? 'status err' : 'status';
+    const missing = RIVERS.filter(r => !(d[r.id] && d[r.id]['00060'] && d[r.id]['00060'].length)).map(r => r.name);
+    const when = new Date(res.t).toLocaleTimeString();
+    let msg = res.stale ? `USGS request failed (${res.err}). Showing saved data from ${when}.` : 'Data as of ' + when;
+    if (missing.length) msg += ' | No data returned for: ' + missing.join('; ');
+    $('status').textContent = msg;
+    $('status').className = (res.stale || missing.length) ? 'status err' : 'status';
   } catch (e) {
-    $('status').textContent = 'Error: ' + e.message; $('status').className = 'status err';
+    $('status').textContent = 'Error: ' + e.message + '. If this is HTTP 429, wait an hour and reload.'; $('status').className = 'status err';
   }
 }
 
 document.querySelectorAll('button[data-r]').forEach(b => b.onclick = () => { range = +b.dataset.r; load(); });
+$('showRate').onchange = renderLake; $('rateWin').oninput = renderLake;
 $('log').onchange = render; $('inclGC').onchange = render;
 load();
-setInterval(load, 15 * 60 * 1000);
+setInterval(() => { if (!document.hidden) load(); }, 15 * 60 * 1000);
 </script>
 </body>
 </html>
