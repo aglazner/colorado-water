@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- Colorado Plateau rivers & Lake Powell dashboard, version 1.4 (2026-11-01) -->
+<!-- Colorado Plateau rivers & Lake Powell dashboard, version 1.5 (2026-11-01) -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -32,13 +32,13 @@
 <body>
 <div class="wrap">
   <h1>Colorado Plateau rivers &amp; Lake Powell</h1>
-  <div class="sub">Live data from USGS National Water Information System. Discharge in cubic feet per second (cfs); lake elevation in feet. <span style="opacity:.8">v1.4 · 2026-11-01</span></div>
+  <div class="sub">Live data from USGS National Water Information System. Discharge in cubic feet per second (cfs); lake elevation in feet. <span style="opacity:.8">v1.5 · 2026-11-01</span></div>
 
   <div class="controls">
     <button data-r="7">7 days</button>
     <button data-r="30">30 days</button>
     <button data-r="365">1 year</button>
-    <label><input type="checkbox" id="log"> log scale (discharge; zeros omitted)</label>
+    <label><input type="checkbox" id="log"> log scale (discharge; axis starts at 100 cfs)</label>
     <label><input type="checkbox" id="inclGC"> include Paria + Little Colorado in sum</label>
     <span class="status" id="status"></span>
   </div>
@@ -158,6 +158,7 @@ function niceTicks(min, max, n) {
   return out;
 }
 
+let clipN = 0;
 function draw(el, tipEl, legEl, latEl, series, opts) {
   const W = 900, H = 340, m = {l:62, r:14, t:10, b:30};
   if (opts.log) series = series.map(s => ({...s, pts: s.pts.filter(p => p[1] > 0)}));
@@ -172,8 +173,8 @@ function draw(el, tipEl, legEl, latEl, series, opts) {
   const f = log ? Math.log10 : (x => x);
   let y0, y1, ticks;
   if (log) {
-    y0 = Math.floor(Math.log10(v0)); y1 = Math.ceil(Math.log10(v1));
-    if (y1 === y0) y1++;
+    y0 = Math.max(Math.floor(Math.log10(v0)), Math.log10(opts.logMin || 1e-9)); y1 = Math.ceil(Math.log10(v1));
+    if (y1 <= y0) y1 = y0 + 1;
     ticks = []; for (let e = y0; e <= y1; e++) ticks.push(Math.pow(10, e));
   } else {
     const pad = (v1 - v0) * 0.06 || 1;
@@ -212,11 +213,14 @@ function draw(el, tipEl, legEl, latEl, series, opts) {
     const t = t0 + (t1 - t0) * i / 5, x = X(t);
     g += `<text x="${x}" y="${H-10}" text-anchor="${i==0?'start':i==5?'end':'middle'}" font-size="11" fill="var(--muted)">${fmtDate(t, range)}</text>`;
   }
+  const clipId = 'clip' + (++clipN);
+  g += `<clipPath id="${clipId}"><rect x="${m.l}" y="${m.t}" width="${W-m.l-m.r}" height="${H-m.t-m.b}"/></clipPath><g clip-path="url(#${clipId})">`;
   series.forEach(s => {
     if (!s.pts.length) return;
     const d = s.pts.map((p,i) => (i?'L':'M') + X(p[0]).toFixed(1) + ' ' + Y(p[1]).toFixed(1)).join('');
     g += `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="${s.width||1.8}" ${s.dash?`stroke-dasharray="${s.dash}"`:''} stroke-linejoin="round"/>`;
   });
+  g += '</g>';
   g += `<line id="cur" y1="${m.t}" y2="${H-m.b}" stroke="var(--muted)" stroke-dasharray="3 3" style="display:none"/>`;
   g += `<text x="14" y="${H/2}" transform="rotate(-90 14 ${H/2})" text-anchor="middle" font-size="11" fill="var(--muted)">${opts.ylabel}</text>`;
   el.innerHTML = `<svg viewBox="0 0 ${W} ${H}">${g}<rect x="${m.l}" y="${m.t}" width="${W-m.l-m.r}" height="${H-m.t-m.b}" fill="transparent" id="hit"/></svg>`;
@@ -276,7 +280,7 @@ function render() {
   const incl = $('inclGC').checked;
   // Plot 1: all rivers except the dam release
   const q = cacheQ.filter(s => !s.lees);
-  draw($('chartQ'), $('tipQ'), $('legQ'), $('latQ'), q, {log: $('log').checked, ylabel:'Discharge (cfs)', unit:'cfs'});
+  draw($('chartQ'), $('tipQ'), $('legQ'), $('latQ'), q, {log: $('log').checked, logMin: 100, ylabel:'Discharge (cfs)', unit:'cfs'});
 
   // Plot 2: sum + Lees Ferry
   const core = cacheQ.filter(s => s.core);
@@ -284,14 +288,14 @@ function render() {
   const sumName = 'Sum: Colorado + Green + San Juan + Escalante + Dirty Devil' + (incl ? ' + Paria + Little Colorado' : '');
   const two = [{ name: sumName, color:'var(--fg)', width:2.2, pts: sumSeries(core, extra) }];
   two.push(...cacheQ.filter(s => s.lees).map(s => ({...s, dash:null})));
-  draw($('chartS'), $('tipS'), $('legS'), $('latS'), two, {log: $('log').checked, ylabel:'Discharge (cfs)', unit:'cfs'});
+  draw($('chartS'), $('tipS'), $('legS'), $('latS'), two, {log: $('log').checked, logMin: 100, ylabel:'Discharge (cfs)', unit:'cfs'});
 
   // Plot 4: Grand Canyon flow below the Little Colorado
   const lees = cacheQ.filter(s => s.lees), gcs = cacheQ.filter(s => s.gc);
   const gcSeries = [{ name:'Estimated flow below Little Colorado (sum)', color:'var(--fg)', width:2.2, pts: sumSeries(lees, gcs) },
                     ...lees.map(s => ({...s, dash:null, width:1.2})),
                     ...gcs.map(s => ({...s, width:1.2}))];
-  draw($('chartG'), $('tipG'), $('legG'), $('latG'), gcSeries, {log: $('log').checked, ylabel:'Discharge (cfs)', unit:'cfs'});
+  draw($('chartG'), $('tipG'), $('legG'), $('latG'), gcSeries, {log: $('log').checked, logMin: 100, ylabel:'Discharge (cfs)', unit:'cfs'});
 
   // Plot 3: lake
   draw($('chartL'), $('tipL'), $('legL'), $('latL'), lSeries, {log:false, ylabel:'Elevation (ft, NAVD 88)', unit:'ft',
